@@ -30,9 +30,9 @@ services:
     container_name: prefect_server
     command: prefect server start --host 0.0.0.0
     environment:
-      - PREFECT_UI_API_URL=http://localhost:4200/api
+      - PREFECT_UI_API_URL=http://localhost:4201/api
     ports:
-      - "4200:4200"
+      - "4201:4200"
     networks:
       - data_network
 
