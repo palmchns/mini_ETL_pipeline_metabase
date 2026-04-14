@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # 1. โกดังข้อมูล (Data Warehouse)
+  postgres_dw:
+    image: postgres:15-alpine
+    container_name: postgres_dw
+    env_file: .env
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - dw_data:/var/lib/postgresql/data
+    networks:
+      - data_network
+
+  # 2. เครื่องมือสร้าง Dashboard (Metabase)
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres_dw
+    networks:
+      - data_network
+
+  # 3. ตัวจัดการ Pipeline (Prefect Server)
+  prefect_server:
+    image: prefecthq/prefect:3-latest
+    container_name: prefect_server
+    command: prefect server start --host 0.0.0.0
+    environment:
+      - PREFECT_UI_API_URL=http://localhost:4200/api
+    ports:
+      - "4200:4200"
+    networks:
+      - data_network
+
+  # 4. ตัวทดลองเขียนโค้ด (Jupyter Notebook)
+  jupyter:
+    image: jupyter/scipy-notebook:latest
+    container_name: jupyter_dev
+    user: root
+    environment:
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+    volumes:
+      - .:/home/jovyan/work
+    ports:
+      - "8888:8888"
+    networks:
+      - data_network
+
+  # 5. ตัวรัน Pipeline (Build จาก Dockerfile)
+  etl_runner:
+    build: .
+    container_name: etl_runner
+    depends_on:
+      - prefect_server
+      - postgres_dw
+    env_file: .env
+    environment:
+      - PREFECT_API_URL=http://prefect_server:4200/api
+      - IN_DOCKER=true
+    networks:
+      - data_network
+
+volumes:
+  dw_data:
+
+networks:
+  data_network:
+    driver: bridge
