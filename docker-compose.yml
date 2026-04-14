@@ -43,6 +43,7 @@ services:
     user: root
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - IN_DOCKER=true  # <--- [เพิ่ม] เพื่อให้ Jupyter รู้ว่าต้องต่อ Host ชื่อ postgres_dw
     volumes:
       - .:/home/jovyan/work
     ports:
@@ -61,6 +62,8 @@ services:
     environment:
       - PREFECT_API_URL=http://prefect_server:4200/api
       - IN_DOCKER=true
+    # <--- [เพิ่ม] หน่วงเวลา 15 วินาทีรอ Prefect พร้อม แล้วค่อยรันโค้ดอัตโนมัติ
+    command: bash -c "sleep 15 && python ETL_pipeline.py" 
     networks:
       - data_network
 
