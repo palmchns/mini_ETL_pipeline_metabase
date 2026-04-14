@@ -16,9 +16,9 @@ services:
   # 2. เครื่องมือสร้าง Dashboard (Metabase)
   metabase:
     image: metabase/metabase:latest
-    container_name: metabase
+    container_name: metabase_chinook_northwind
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on:
       - postgres_dw
     networks:
