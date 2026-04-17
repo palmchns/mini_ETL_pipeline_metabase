@@ -5,9 +5,12 @@ services:
   postgres_dw:
     image: postgres:15-alpine
     container_name: postgres_dw
-    env_file: .env
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "5435:5432"
+    environment:
+      - POSTGRES_USER=engineer
+      - POSTGRES_PASSWORD=password123
+      - POSTGRES_DB=data_warehouse
     volumes:
       - dw_data:/var/lib/postgresql/data
     networks:
@@ -21,10 +24,8 @@ services:
       - "3001:3000"
     depends_on:
       - postgres_dw
-    # <--- [เพิ่ม] ตั้งค่าให้ Metabase เซฟไฟล์ระบบไว้ข้างนอก
     environment:                           
       - MB_DB_FILE=/metabase-data/metabase.db 
-    # <--- [เพิ่ม] ผูกโฟลเดอร์เก็บข้อมูลถาวรให้ Metabase
     volumes:                               
       - metabase_data:/metabase-data
     networks:
@@ -48,8 +49,8 @@ services:
     container_name: jupyter_dev
     user: root
     environment:
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
-      - IN_DOCKER=true  # <--- [เพิ่ม] เพื่อให้ Jupyter รู้ว่าต้องต่อ Host ชื่อ postgres_dw
+      - JUPYTER_TOKEN=prefect
+      - IN_DOCKER=true
     volumes:
       - .:/home/jovyan/work
     ports:
@@ -64,16 +65,16 @@ services:
     depends_on:
       - prefect_server
       - postgres_dw
-    env_file: .env
     environment:
       - PREFECT_API_URL=http://prefect_server:4200/api
       - IN_DOCKER=true
-    # <--- [เพิ่ม] หน่วงเวลา 15 วินาทีรอ Prefect พร้อม แล้วค่อยรันโค้ดอัตโนมัติ
+      - POSTGRES_USER=engineer
+      - POSTGRES_PASSWORD=password123
+      - POSTGRES_DB=data_warehouse
     command: bash -c "sleep 15 && python ETL_pipeline.py" 
     networks:
       - data_network
 
-# <--- [เพิ่ม] ประกาศสร้างพื้นที่เก็บข้อมูลถาวร
 volumes:
   dw_data:
   metabase_data: 

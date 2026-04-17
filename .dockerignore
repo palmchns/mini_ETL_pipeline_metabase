@@ -1,0 +1,8 @@
+# ไม่นำไฟล์ฐานข้อมูลเก่าในเครื่องเข้า Container
+*.db
+*.sqlite
+
+# ไม่นำไฟล์แคชและขยะเข้า Container
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
