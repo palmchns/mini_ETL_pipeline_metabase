@@ -21,6 +21,12 @@ services:
       - "3001:3000"
     depends_on:
       - postgres_dw
+    # <--- [เพิ่ม] ตั้งค่าให้ Metabase เซฟไฟล์ระบบไว้ข้างนอก
+    environment:                           
+      - MB_DB_FILE=/metabase-data/metabase.db 
+    # <--- [เพิ่ม] ผูกโฟลเดอร์เก็บข้อมูลถาวรให้ Metabase
+    volumes:                               
+      - metabase_data:/metabase-data
     networks:
       - data_network
 
@@ -67,8 +73,10 @@ services:
     networks:
       - data_network
 
+# <--- [เพิ่ม] ประกาศสร้างพื้นที่เก็บข้อมูลถาวร
 volumes:
   dw_data:
+  metabase_data: 
 
 networks:
   data_network:

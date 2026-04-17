@@ -63,12 +63,20 @@ def main_flow():
     # 1. โหลดฐานข้อมูล
     download_db()
     
-    # 2. จัดการย้าย Northwind
-    nw_tables = ["Orders", "Order Details", "Products", "Customers"]
+    # 2. จัดการย้าย Northwind (ดึงครบทุกตาราง ยกเว้น sqlite_sequence)
+    nw_tables = [
+        "Categories", "CustomerCustomerDemo", "CustomerDemographics", 
+        "Customers", "Employees", "EmployeeTerritories", "Order Details", 
+        "Orders", "Products", "Regions", "Shippers", "Suppliers", "Territories"
+    ]
     etl_task("northwind.db", nw_tables, "nw")
     
-    # 3. จัดการย้าย Chinook
-    cnk_tables = ["Invoice", "Track", "Customer", "Artist"]
+    # 3. จัดการย้าย Chinook (ครบทั้ง 11 ตาราง)
+    cnk_tables = [
+        "Album", "Artist", "Customer", "Employee", "Genre", 
+        "Invoice", "InvoiceLine", "MediaType", "Playlist", 
+        "PlaylistTrack", "Track"
+    ]
     etl_task("chinook.db", cnk_tables, "cnk")
 
 if __name__ == "__main__":
