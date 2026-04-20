@@ -1,8 +1,8 @@
+import pandas as pd
+from sqlalchemy import create_engine, text
 import os
 import requests
 import tempfile
-import pandas as pd
-from sqlalchemy import create_engine, text, inspect
 from prefect import task, flow
 
 # ==========================================
@@ -16,167 +16,109 @@ DB_PORT = "5432" if os.getenv("IN_DOCKER") else "5435"
 
 PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_DB}"
 
-# สร้างโฟลเดอร์จำลอง Data Lake (Bronze Layer) ในเครื่อง
-LAKE_PATH = "./data/bronze"
-os.makedirs(LAKE_PATH, exist_ok=True)
-
 # ==========================================
-# 🥉 Task 1: Extract & Load ALL Tables to Bronze (Parquet)
+# 🥉 Task 1: Extract & Load to Bronze (Postgres Raw)
 # ==========================================
 @task(log_prints=True, retries=2)
-def extract_to_bronze_parquet():
+def load_raw_to_postgres():
     """
-    โหลด SQLite ลง Temp File -> สแกนหา 'ทุกตาราง' อัตโนมัติ -> เซฟเป็น Parquet (Data Lake) -> ลบ Temp File
+    ดาวน์โหลด SQLite ลง Temp File ใน Docker -> อ่านด้วย Pandas -> โหลดเข้าตาราง _raw_ ใน Postgres
     """
     sources = {
-        "chinook": "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite",
-        "northwind": "https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db"
+        "chinook": ("https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite", 
+                    ["Customer", "Track", "Genre", "Invoice", "InvoiceLine"]),
+        "nw": ("https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db", 
+               ["Customers", "Products", "Categories", "Orders", "Order Details"])
     }
     
-    parquet_files = []
+    target_engine = create_engine(PG_URI)
 
-    for source_name, url in sources.items():
-        print(f"📥 Downloading {source_name} to Temporary File...")
+    for prefix, (url, tables) in sources.items():
+        print(f"📥 Downloading {prefix} database...")
         r = requests.get(url)
         
-        # ใช้ delete=False เพื่อให้ SQLAlchemy เข้าถึงไฟล์ได้
-        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        tmp.write(r.content)
-        tmp.close() 
-        
-        try:
+        # ใช้ Temp file ซึ่งจะหายไปเองเมื่อออกจาก block ไม่รกพื้นที่ใน Docker
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            tmp.write(r.content)
+            tmp.flush()
+            
             src_engine = create_engine(f"sqlite:///{tmp.name}")
             
-            # 🛠️ ใช้ Inspector สแกนหาทุกตารางที่มีใน Database อัตโนมัติ
-            inspector = inspect(src_engine)
-            tables = inspector.get_table_names()
-            
-            print(f"🔍 Found {len(tables)} tables in {source_name}...")
-            
             for table in tables:
+                print(f"⏳ Extracting raw {table}...")
                 df = pd.read_sql(f'SELECT * FROM "{table}"', src_engine)
                 
-                # Clean ชื่อคอลัมน์ให้อ่านง่ายและเป็นมาตรฐาน (ตัวเล็กทั้งหมด, แทนที่ช่องว่างด้วย _)
+                # ทำความสะอาดชื่อคอลัมน์ให้อ่านง่าย
                 df.columns = [c.lower().replace(' ', '_') for c in df.columns]
                 
-                # จัดการชื่อไฟล์
-                clean_table_name = table.lower().replace(' ', '_')
-                file_name = f"{source_name}_{clean_table_name}.parquet"
-                file_path = os.path.join(LAKE_PATH, file_name)
+                # แปลงวันที่
+                for col in df.columns:
+                    if 'date' in col.lower() or 'time' in col.lower():
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
                 
-                # เซฟลง Data Lake เป็นไฟล์ Parquet
-                df.to_parquet(file_path, index=False)
-                parquet_files.append((source_name, clean_table_name, file_path))
-                print(f"   ✅ Saved {table} -> {file_name}")
-                
-        finally:
-            # ทำลาย Temp File ทิ้งทันทีเพื่อไม่ให้รกเครื่อง
-            os.unlink(tmp.name)
-            
-    return parquet_files
+                # โหลดเข้าตาราง raw ใน Postgres (รันครั้งเดียว ใช้ replace ได้เลย)
+                target_name = f"{prefix}_raw_{table.lower().replace(' ', '_')}"
+                df.to_sql(target_name, target_engine, if_exists="replace", index=False)
+                print(f"✅ {target_name} loaded: {len(df)} rows")
 
 # ==========================================
-# 🥇 Task 2: ELT to Star Schema (Postgres)
+# 🥇 Task 2: In-Database Transform (Star Schema)
 # ==========================================
 @task(log_prints=True)
-def load_staging_and_transform_elt(parquet_files):
+def transform_star_schema_in_db():
     """
-    เลือกเฉพาะ Parquet ที่ใช้ -> โหลดเข้า Staging -> ใช้ SQL ประมวลผลเป็น Star Schema -> ลบ Staging
+    ใช้ SQL ประมวลผลจากตาราง Raw เพื่อสร้าง Star Schema ใน Postgres โดยตรง
+    รวดเร็ว และไม่กิน RAM ของ Docker Container
     """
+    print("⏳ Executing In-Database Transformation for Star Schema...")
     target_engine = create_engine(PG_URI)
     
-    # กำหนดเฉพาะตารางที่จำเป็นต้องใช้ในการทำ Star Schema เพื่อประหยัดพื้นที่ Staging
-    tables_needed = {
-        "chinook": ["customer", "track", "genre", "invoice", "invoiceline"],
-        "northwind": ["customers", "products", "categories", "orders", "order_details"]
-    }
-    
-    loaded_stg_tables = []
-
-    # 1. โหลดข้อมูลจาก Parquet เข้าตารางชั่วคราว (Staging) เฉพาะตารางที่ต้องใช้
-    print("🚀 Loading necessary Parquet data to Postgres Staging tables...")
-    for source, table, path in parquet_files:
-        if table in tables_needed.get(source, []):
-            df = pd.read_parquet(path)
-            stg_table_name = f"stg_{source}_{table}"
-            df.to_sql(stg_table_name, target_engine, if_exists="replace", index=False)
-            loaded_stg_tables.append(stg_table_name)
-            print(f"   -> Loaded {stg_table_name}")
-
-    print("⚡ Executing In-Database Transformation (ELT)...")
     with target_engine.begin() as conn:
         
-        # ---------------------------------------------------------
-        # 2. สร้างตารางและทำ UPSERT (DimCustomer)
-        # ---------------------------------------------------------
+        # 1. สร้างและโหลด DimCustomer (ใช้ DROP & CREATE สำหรับ One-time run)
+        conn.execute(text("DROP TABLE IF EXISTS dim_customer CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS dim_customer (
+            CREATE TABLE dim_customer (
                 customer_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                integration_id VARCHAR(100) UNIQUE,
+                integration_id VARCHAR(100),
                 customer_name VARCHAR(255),
                 company VARCHAR(255),
                 city VARCHAR(100),
                 country VARCHAR(100)
             );
         """))
-        
-        # Insert/Update ฝั่ง Chinook
         conn.execute(text("""
             INSERT INTO dim_customer (integration_id, customer_name, company, city, country)
-            SELECT 'CHN_' || customerid, firstname || ' ' || lastname, company, city, country 
-            FROM stg_chinook_customer
-            ON CONFLICT (integration_id) DO UPDATE 
-            SET customer_name = EXCLUDED.customer_name, company = EXCLUDED.company, 
-                city = EXCLUDED.city, country = EXCLUDED.country;
+            SELECT 'CHN_' || customerid, firstname || ' ' || lastname, company, city, country FROM chinook_raw_customer
+            UNION ALL
+            SELECT 'NWD_' || customerid, contactname, companyname, city, country FROM nw_raw_customers;
         """))
-        
-        # Insert/Update ฝั่ง Northwind
-        conn.execute(text("""
-            INSERT INTO dim_customer (integration_id, customer_name, company, city, country)
-            SELECT 'NWD_' || customerid, contactname, companyname, city, country 
-            FROM stg_northwind_customers
-            ON CONFLICT (integration_id) DO UPDATE 
-            SET customer_name = EXCLUDED.customer_name, company = EXCLUDED.company, 
-                city = EXCLUDED.city, country = EXCLUDED.country;
-        """))
-        print("✅ DimCustomer Updated (UPSERT)")
+        print("✅ dim_customer created")
 
-        # ---------------------------------------------------------
-        # 3. สร้างตารางและทำ UPSERT (DimProduct)
-        # ---------------------------------------------------------
+        # 2. สร้างและโหลด DimProduct
+        conn.execute(text("DROP TABLE IF EXISTS dim_product CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS dim_product (
+            CREATE TABLE dim_product (
                 product_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                integration_id VARCHAR(100) UNIQUE,
+                integration_id VARCHAR(100),
                 product_name VARCHAR(255),
                 category_name VARCHAR(255)
             );
         """))
-        
         conn.execute(text("""
             INSERT INTO dim_product (integration_id, product_name, category_name)
             SELECT 'CHN_' || t.trackid, t.name, g.name 
-            FROM stg_chinook_track t
-            LEFT JOIN stg_chinook_genre g ON t.genreid = g.genreid
-            ON CONFLICT (integration_id) DO UPDATE 
-            SET product_name = EXCLUDED.product_name, category_name = EXCLUDED.category_name;
-        """))
-        
-        conn.execute(text("""
-            INSERT INTO dim_product (integration_id, product_name, category_name)
+            FROM chinook_raw_track t LEFT JOIN chinook_raw_genre g ON t.genreid = g.genreid
+            UNION ALL
             SELECT 'NWD_' || p.productid, p.productname, c.categoryname 
-            FROM stg_northwind_products p
-            LEFT JOIN stg_northwind_categories c ON p.categoryid = c.categoryid
-            ON CONFLICT (integration_id) DO UPDATE 
-            SET product_name = EXCLUDED.product_name, category_name = EXCLUDED.category_name;
+            FROM nw_raw_products p LEFT JOIN nw_raw_categories c ON p.categoryid = c.categoryid;
         """))
-        print("✅ DimProduct Updated (UPSERT)")
+        print("✅ dim_product created")
 
-        # ---------------------------------------------------------
-        # 4. สร้างตาราง FactSales (และ Reload ข้อมูล)
-        # ---------------------------------------------------------
+        # 3. สร้างและโหลด FactSales
+        conn.execute(text("DROP TABLE IF EXISTS fact_sales CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS fact_sales (
+            CREATE TABLE fact_sales (
                 sales_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 date_key INT,
                 product_key INT,
@@ -187,63 +129,42 @@ def load_staging_and_transform_elt(parquet_files):
                 source_system VARCHAR(50)
             );
         """))
-        
-        # เคลียร์ Fact Table เก่าก่อนเพื่อความ Idempotent (รันซ้ำกี่รอบข้อมูลก็ไม่เบิ้ล)
-        conn.execute(text("TRUNCATE TABLE fact_sales RESTART IDENTITY;"))
-        
-        # รวมยอดขาย Chinook
+        # ยอดขาย Chinook
         conn.execute(text("""
             INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
             SELECT 
-                CAST(TO_CHAR(CAST(i.invoicedate AS TIMESTAMP), 'YYYYMMDD') AS INT) AS date_key,
-                dp.product_key,
-                dc.customer_key,
-                il.quantity,
-                il.unitprice,
-                (il.quantity * il.unitprice) AS sales_amount,
-                'Chinook'
-            FROM stg_chinook_invoiceline il
-            JOIN stg_chinook_invoice i ON il.invoiceid = i.invoiceid
+                CAST(TO_CHAR(CAST(i.invoicedate AS TIMESTAMP), 'YYYYMMDD') AS INT),
+                dp.product_key, dc.customer_key, il.quantity, il.unitprice,
+                (il.quantity * il.unitprice), 'Chinook'
+            FROM chinook_raw_invoiceline il
+            JOIN chinook_raw_invoice i ON il.invoiceid = i.invoiceid
             LEFT JOIN dim_product dp ON dp.integration_id = 'CHN_' || il.trackid
             LEFT JOIN dim_customer dc ON dc.integration_id = 'CHN_' || i.customerid;
         """))
-
-        # รวมยอดขาย Northwind
+        # ยอดขาย Northwind
         conn.execute(text("""
             INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
             SELECT 
-                CAST(TO_CHAR(CAST(o.orderdate AS TIMESTAMP), 'YYYYMMDD') AS INT) AS date_key,
-                dp.product_key,
-                dc.customer_key,
-                od.quantity,
-                od.unitprice,
-                (od.quantity * od.unitprice) AS sales_amount,
-                'Northwind'
-            FROM stg_northwind_order_details od
-            JOIN stg_northwind_orders o ON od.orderid = o.orderid
+                CAST(TO_CHAR(CAST(o.orderdate AS TIMESTAMP), 'YYYYMMDD') AS INT),
+                dp.product_key, dc.customer_key, od.quantity, od.unitprice,
+                (od.quantity * od.unitprice), 'Northwind'
+            FROM nw_raw_order_details od
+            JOIN nw_raw_orders o ON od.orderid = o.orderid
             LEFT JOIN dim_product dp ON dp.integration_id = 'NWD_' || od.productid
             LEFT JOIN dim_customer dc ON dc.integration_id = 'NWD_' || o.customerid;
         """))
-        print("✅ FactSales Reloaded")
-
-        # ---------------------------------------------------------
-        # 5. ลบตาราง Staging เพื่อประหยัดพื้นที่ Postgres (Housekeeping)
-        # ---------------------------------------------------------
-        for stg_table in loaded_stg_tables:
-            conn.execute(text(f"DROP TABLE IF EXISTS {stg_table};"))
-        print("🧹 Cleaned up staging tables.")
+        print("✅ fact_sales created")
 
 # ==========================================
 #  Orchestration Flow
 # ==========================================
-@flow(name="End-to-End OmniCorp Pipeline (Data Lakehouse)")
+@flow(name="One-Time OmniCorp Initial Load (Docker Optimized)")
 def main_flow():
-    # 1. โหลดข้อมูลลงโฟลเดอร์เครื่องเป็น Parquet (ครบทั้ง 24 ตาราง)
-    parquet_files = extract_to_bronze_parquet()
+    # 1. ดูดข้อมูลลงตาราง _raw_ ใน Postgres (ผ่าน Temp file เพื่อไม่ให้ Docker รก)
+    load_raw_to_postgres()
     
-    # 2. ทำ ELT แปลงเป็น Star Schema ใน Postgres (ใช้แค่ 10 ตารางที่จำเป็น)
-    if parquet_files:
-        load_staging_and_transform_elt(parquet_files)
+    # 2. ให้ Postgres จัดการ Join และสร้าง Star Schema ให้เอง (ประหยัด RAM)
+    transform_star_schema_in_db()
 
 if __name__ == "__main__":
     main_flow()
