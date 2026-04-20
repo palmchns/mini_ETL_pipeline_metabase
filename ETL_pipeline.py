@@ -1,10 +1,13 @@
-import pandas as pd
-from sqlalchemy import create_engine
 import os
 import requests
+import tempfile
+import pandas as pd
+from sqlalchemy import create_engine, text, inspect
 from prefect import task, flow
 
-# ตั้งค่า Database Connection (ดึงจาก Environment ที่ฝังใน Docker Compose)
+# ==========================================
+# ⚙️ Configuration & Database Setup
+# ==========================================
 DB_HOST = "postgres_dw" if os.getenv("IN_DOCKER") else "localhost"
 DB_USER = os.getenv("POSTGRES_USER", "engineer")
 DB_PASS = os.getenv("POSTGRES_PASSWORD", "password123")
@@ -13,170 +16,234 @@ DB_PORT = "5432" if os.getenv("IN_DOCKER") else "5435"
 
 PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_DB}"
 
-@task(log_prints=True, retries=3)
-def download_db(force_download=True):
+# สร้างโฟลเดอร์จำลอง Data Lake (Bronze Layer) ในเครื่อง
+LAKE_PATH = "./data/bronze"
+os.makedirs(LAKE_PATH, exist_ok=True)
+
+# ==========================================
+# 🥉 Task 1: Extract & Load ALL Tables to Bronze (Parquet)
+# ==========================================
+@task(log_prints=True, retries=2)
+def extract_to_bronze_parquet():
+    """
+    โหลด SQLite ลง Temp File -> สแกนหา 'ทุกตาราง' อัตโนมัติ -> เซฟเป็น Parquet (Data Lake) -> ลบ Temp File
+    """
     sources = {
-        "chinook.db": "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite",
-        "northwind.db": "https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db"
+        "chinook": "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite",
+        "northwind": "https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db"
     }
     
-    for name, url in sources.items():
-        if force_download and os.path.exists(name):
-            os.remove(name)
-            print(f"🗑️ Removed old {name} to force a fresh download.")
-            
-        if not os.path.exists(name):
-            print(f"📥 Downloading fresh {name}...")
-            r = requests.get(url)
-            with open(name, "wb") as f:
-                f.write(r.content)
-            print(f"✅ Downloaded {name} successfully.")
-        else:
-            print(f"✅ {name} already exists and is ready to use.")
-            
-    return list(sources.keys())
+    parquet_files = []
 
-@task(log_prints=True)
-def load_raw_tables(db_file, tables, prefix):
-    db_path = os.path.abspath(db_file)
-    src_engine = create_engine(f"sqlite:///{db_path}")
-    target_engine = create_engine(PG_URI)
-    
-    for table in tables:
-        print(f"⏳ Extracting raw {table}...")
-        df = pd.read_sql(f'SELECT * FROM "{table}"', src_engine)
-        df.columns = [c.lower().replace(' ', '_') for c in df.columns]
-        for col in df.columns:
-            if 'date' in col.lower() or 'time' in col.lower():
-                df[col] = pd.to_datetime(df[col], errors='coerce')
+    for source_name, url in sources.items():
+        print(f"📥 Downloading {source_name} to Temporary File...")
+        r = requests.get(url)
+        
+        # ใช้ delete=False เพื่อให้ SQLAlchemy เข้าถึงไฟล์ได้
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        tmp.write(r.content)
+        tmp.close() 
+        
+        try:
+            src_engine = create_engine(f"sqlite:///{tmp.name}")
+            
+            # 🛠️ ใช้ Inspector สแกนหาทุกตารางที่มีใน Database อัตโนมัติ
+            inspector = inspect(src_engine)
+            tables = inspector.get_table_names()
+            
+            print(f"🔍 Found {len(tables)} tables in {source_name}...")
+            
+            for table in tables:
+                df = pd.read_sql(f'SELECT * FROM "{table}"', src_engine)
                 
-        target_name = f"{prefix}_raw_{table.lower().replace(' ', '_')}"
-        df.to_sql(target_name, target_engine, if_exists="replace", index=False)
-        print(f"✅ {target_name} loaded: {len(df)} rows")
+                # Clean ชื่อคอลัมน์ให้อ่านง่ายและเป็นมาตรฐาน (ตัวเล็กทั้งหมด, แทนที่ช่องว่างด้วย _)
+                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                
+                # จัดการชื่อไฟล์
+                clean_table_name = table.lower().replace(' ', '_')
+                file_name = f"{source_name}_{clean_table_name}.parquet"
+                file_path = os.path.join(LAKE_PATH, file_name)
+                
+                # เซฟลง Data Lake เป็นไฟล์ Parquet
+                df.to_parquet(file_path, index=False)
+                parquet_files.append((source_name, clean_table_name, file_path))
+                print(f"   ✅ Saved {table} -> {file_name}")
+                
+        finally:
+            # ทำลาย Temp File ทิ้งทันทีเพื่อไม่ให้รกเครื่อง
+            os.unlink(tmp.name)
+            
+    return parquet_files
 
+# ==========================================
+# 🥇 Task 2: ELT to Star Schema (Postgres)
+# ==========================================
 @task(log_prints=True)
-def transform_omnicorp_star_schema():
-    print("⏳ Integrating Chinook and Northwind into Unified Star Schema...")
-    cnk_engine = create_engine(f"sqlite:///{os.path.abspath('chinook.db')}")
-    nwd_engine = create_engine(f"sqlite:///{os.path.abspath('northwind.db')}")
+def load_staging_and_transform_elt(parquet_files):
+    """
+    เลือกเฉพาะ Parquet ที่ใช้ -> โหลดเข้า Staging -> ใช้ SQL ประมวลผลเป็น Star Schema -> ลบ Staging
+    """
     target_engine = create_engine(PG_URI)
-
-    # ==========================================
-    # 1. สร้าง DimCustomer (รวมลูกค้า 2 บริษัท)
-    # ==========================================
-    c_cnk = pd.read_sql('SELECT CustomerId, FirstName, LastName, Company, City, Country FROM Customer', cnk_engine)
-    c_nwd = pd.read_sql('SELECT CustomerID, ContactName, CompanyName, City, Country FROM Customers', nwd_engine)
-
-    c_cnk['CustomerName'] = c_cnk['FirstName'] + ' ' + c_cnk['LastName']
-    c_cnk['IntegrationID'] = 'CHN_' + c_cnk['CustomerId'].astype(str)
     
-    c_nwd['IntegrationID'] = 'NWD_' + c_nwd['CustomerID'].astype(str)
-    c_nwd.rename(columns={'ContactName': 'CustomerName', 'CompanyName': 'Company'}, inplace=True)
-
-    dim_customer = pd.concat([
-        c_cnk[['IntegrationID', 'CustomerName', 'Company', 'City', 'Country']],
-        c_nwd[['IntegrationID', 'CustomerName', 'Company', 'City', 'Country']]
-    ], ignore_index=True)
-    # สร้าง Surrogate Key (CustomerKey)
-    dim_customer.insert(0, 'CustomerKey', range(1, 1 + len(dim_customer)))
-    dim_customer.to_sql('dim_customer', target_engine, if_exists='replace', index=False)
-    print("✅ dim_customer created")
-
-    # ==========================================
-    # 2. สร้าง DimProduct (รวมเพลงและอาหาร)
-    # ==========================================
-    p_cnk = pd.read_sql('SELECT t.TrackId, t.Name as TrackName, g.Name as Genre FROM Track t LEFT JOIN Genre g ON t.GenreId = g.GenreId', cnk_engine)
-    p_nwd = pd.read_sql('SELECT p.ProductID, p.ProductName, c.CategoryName FROM Products p LEFT JOIN Categories c ON p.CategoryID = c.CategoryID', nwd_engine)
-
-    p_cnk['IntegrationID'] = 'CHN_' + p_cnk['TrackId'].astype(str)
-    p_cnk.rename(columns={'TrackName': 'ProductName', 'Genre': 'CategoryName'}, inplace=True)
+    # กำหนดเฉพาะตารางที่จำเป็นต้องใช้ในการทำ Star Schema เพื่อประหยัดพื้นที่ Staging
+    tables_needed = {
+        "chinook": ["customer", "track", "genre", "invoice", "invoiceline"],
+        "northwind": ["customers", "products", "categories", "orders", "order_details"]
+    }
     
-    p_nwd['IntegrationID'] = 'NWD_' + p_nwd['ProductID'].astype(str)
+    loaded_stg_tables = []
 
-    dim_product = pd.concat([
-        p_cnk[['IntegrationID', 'ProductName', 'CategoryName']],
-        p_nwd[['IntegrationID', 'ProductName', 'CategoryName']]
-    ], ignore_index=True)
-    # สร้าง Surrogate Key (ProductKey)
-    dim_product.insert(0, 'ProductKey', range(1, 1 + len(dim_product)))
-    dim_product.to_sql('dim_product', target_engine, if_exists='replace', index=False)
-    print("✅ dim_product created")
+    # 1. โหลดข้อมูลจาก Parquet เข้าตารางชั่วคราว (Staging) เฉพาะตารางที่ต้องใช้
+    print("🚀 Loading necessary Parquet data to Postgres Staging tables...")
+    for source, table, path in parquet_files:
+        if table in tables_needed.get(source, []):
+            df = pd.read_parquet(path)
+            stg_table_name = f"stg_{source}_{table}"
+            df.to_sql(stg_table_name, target_engine, if_exists="replace", index=False)
+            loaded_stg_tables.append(stg_table_name)
+            print(f"   -> Loaded {stg_table_name}")
 
-    # ==========================================
-    # 3. สร้าง DimDate (ดึงวันที่จากทั้ง 2 ระบบ)
-    # ==========================================
-    inv = pd.read_sql('SELECT InvoiceDate FROM Invoice', cnk_engine)
-    ord = pd.read_sql('SELECT OrderDate FROM Orders', nwd_engine)
-    
-    all_dates = pd.concat([inv['InvoiceDate'], ord['OrderDate']]).dropna()
-    all_dates = pd.to_datetime(all_dates)
-    
-    dim_date = pd.DataFrame({'FullDate': all_dates.dt.date.unique()})
-    dim_date['DateKey'] = dim_date['FullDate'].astype(str).str.replace('-', '').astype(int)
-    dim_date['Year'] = pd.to_datetime(dim_date['FullDate']).dt.year
-    dim_date['Quarter'] = pd.to_datetime(dim_date['FullDate']).dt.quarter
-    dim_date['Month'] = pd.to_datetime(dim_date['FullDate']).dt.month
-    dim_date['MonthName'] = pd.to_datetime(dim_date['FullDate']).dt.strftime('%B')
-    
-    dim_date.to_sql('dim_date', target_engine, if_exists='replace', index=False)
-    print("✅ dim_date created")
+    print("⚡ Executing In-Database Transformation (ELT)...")
+    with target_engine.begin() as conn:
+        
+        # ---------------------------------------------------------
+        # 2. สร้างตารางและทำ UPSERT (DimCustomer)
+        # ---------------------------------------------------------
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_customer (
+                customer_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                integration_id VARCHAR(100) UNIQUE,
+                customer_name VARCHAR(255),
+                company VARCHAR(255),
+                city VARCHAR(100),
+                country VARCHAR(100)
+            );
+        """))
+        
+        # Insert/Update ฝั่ง Chinook
+        conn.execute(text("""
+            INSERT INTO dim_customer (integration_id, customer_name, company, city, country)
+            SELECT 'CHN_' || customerid, firstname || ' ' || lastname, company, city, country 
+            FROM stg_chinook_customer
+            ON CONFLICT (integration_id) DO UPDATE 
+            SET customer_name = EXCLUDED.customer_name, company = EXCLUDED.company, 
+                city = EXCLUDED.city, country = EXCLUDED.country;
+        """))
+        
+        # Insert/Update ฝั่ง Northwind
+        conn.execute(text("""
+            INSERT INTO dim_customer (integration_id, customer_name, company, city, country)
+            SELECT 'NWD_' || customerid, contactname, companyname, city, country 
+            FROM stg_northwind_customers
+            ON CONFLICT (integration_id) DO UPDATE 
+            SET customer_name = EXCLUDED.customer_name, company = EXCLUDED.company, 
+                city = EXCLUDED.city, country = EXCLUDED.country;
+        """))
+        print("✅ DimCustomer Updated (UPSERT)")
 
-    # ==========================================
-    # 4. สร้าง FactSales
-    # ==========================================
-    # ฝั่ง Chinook
-    inv_line = pd.read_sql('SELECT InvoiceId, TrackId, UnitPrice, Quantity FROM InvoiceLine', cnk_engine)
-    inv_df = pd.read_sql('SELECT InvoiceId, CustomerId, InvoiceDate FROM Invoice', cnk_engine)
-    sales_cnk = inv_line.merge(inv_df, on='InvoiceId')
-    sales_cnk['Cust_IntegrationID'] = 'CHN_' + sales_cnk['CustomerId'].astype(str)
-    sales_cnk['Prod_IntegrationID'] = 'CHN_' + sales_cnk['TrackId'].astype(str)
-    sales_cnk['OrderDate'] = pd.to_datetime(sales_cnk['InvoiceDate'])
-    sales_cnk['SourceSystem'] = 'Chinook'
+        # ---------------------------------------------------------
+        # 3. สร้างตารางและทำ UPSERT (DimProduct)
+        # ---------------------------------------------------------
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS dim_product (
+                product_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                integration_id VARCHAR(100) UNIQUE,
+                product_name VARCHAR(255),
+                category_name VARCHAR(255)
+            );
+        """))
+        
+        conn.execute(text("""
+            INSERT INTO dim_product (integration_id, product_name, category_name)
+            SELECT 'CHN_' || t.trackid, t.name, g.name 
+            FROM stg_chinook_track t
+            LEFT JOIN stg_chinook_genre g ON t.genreid = g.genreid
+            ON CONFLICT (integration_id) DO UPDATE 
+            SET product_name = EXCLUDED.product_name, category_name = EXCLUDED.category_name;
+        """))
+        
+        conn.execute(text("""
+            INSERT INTO dim_product (integration_id, product_name, category_name)
+            SELECT 'NWD_' || p.productid, p.productname, c.categoryname 
+            FROM stg_northwind_products p
+            LEFT JOIN stg_northwind_categories c ON p.categoryid = c.categoryid
+            ON CONFLICT (integration_id) DO UPDATE 
+            SET product_name = EXCLUDED.product_name, category_name = EXCLUDED.category_name;
+        """))
+        print("✅ DimProduct Updated (UPSERT)")
 
-    # ฝั่ง Northwind
-    ord_det = pd.read_sql('SELECT OrderID, ProductID, UnitPrice, Quantity FROM "Order Details"', nwd_engine)
-    ord_df = pd.read_sql('SELECT OrderID, CustomerID, OrderDate FROM Orders', nwd_engine)
-    sales_nwd = ord_det.merge(ord_df, on='OrderID')
-    sales_nwd['Cust_IntegrationID'] = 'NWD_' + sales_nwd['CustomerID'].astype(str)
-    sales_nwd['Prod_IntegrationID'] = 'NWD_' + sales_nwd['ProductID'].astype(str)
-    sales_nwd['OrderDate'] = pd.to_datetime(sales_nwd['OrderDate'])
-    sales_nwd['SourceSystem'] = 'Northwind'
+        # ---------------------------------------------------------
+        # 4. สร้างตาราง FactSales (และ Reload ข้อมูล)
+        # ---------------------------------------------------------
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fact_sales (
+                sales_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                date_key INT,
+                product_key INT,
+                customer_key INT,
+                quantity NUMERIC,
+                unit_price NUMERIC,
+                sales_amount NUMERIC,
+                source_system VARCHAR(50)
+            );
+        """))
+        
+        # เคลียร์ Fact Table เก่าก่อนเพื่อความ Idempotent (รันซ้ำกี่รอบข้อมูลก็ไม่เบิ้ล)
+        conn.execute(text("TRUNCATE TABLE fact_sales RESTART IDENTITY;"))
+        
+        # รวมยอดขาย Chinook
+        conn.execute(text("""
+            INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
+            SELECT 
+                CAST(TO_CHAR(CAST(i.invoicedate AS TIMESTAMP), 'YYYYMMDD') AS INT) AS date_key,
+                dp.product_key,
+                dc.customer_key,
+                il.quantity,
+                il.unitprice,
+                (il.quantity * il.unitprice) AS sales_amount,
+                'Chinook'
+            FROM stg_chinook_invoiceline il
+            JOIN stg_chinook_invoice i ON il.invoiceid = i.invoiceid
+            LEFT JOIN dim_product dp ON dp.integration_id = 'CHN_' || il.trackid
+            LEFT JOIN dim_customer dc ON dc.integration_id = 'CHN_' || i.customerid;
+        """))
 
-    # นำ Fact มารวมกัน
-    fact_all = pd.concat([
-        sales_cnk[['OrderDate', 'Cust_IntegrationID', 'Prod_IntegrationID', 'Quantity', 'UnitPrice', 'SourceSystem']],
-        sales_nwd[['OrderDate', 'Cust_IntegrationID', 'Prod_IntegrationID', 'Quantity', 'UnitPrice', 'SourceSystem']]
-    ])
-    
-    # คำนวณยอดขาย และสร้าง DateKey
-    fact_all['SalesAmount'] = fact_all['Quantity'] * fact_all['UnitPrice']
-    fact_all['DateKey'] = fact_all['OrderDate'].dt.strftime('%Y%m%d').astype(int)
+        # รวมยอดขาย Northwind
+        conn.execute(text("""
+            INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
+            SELECT 
+                CAST(TO_CHAR(CAST(o.orderdate AS TIMESTAMP), 'YYYYMMDD') AS INT) AS date_key,
+                dp.product_key,
+                dc.customer_key,
+                od.quantity,
+                od.unitprice,
+                (od.quantity * od.unitprice) AS sales_amount,
+                'Northwind'
+            FROM stg_northwind_order_details od
+            JOIN stg_northwind_orders o ON od.orderid = o.orderid
+            LEFT JOIN dim_product dp ON dp.integration_id = 'NWD_' || od.productid
+            LEFT JOIN dim_customer dc ON dc.integration_id = 'NWD_' || o.customerid;
+        """))
+        print("✅ FactSales Reloaded")
 
-    # Map กลับไปหา Surrogate Key ของ DimCustomer และ DimProduct
-    fact_all = fact_all.merge(dim_customer[['IntegrationID', 'CustomerKey']], left_on='Cust_IntegrationID', right_on='IntegrationID', how='left')
-    fact_all = fact_all.merge(dim_product[['IntegrationID', 'ProductKey']], left_on='Prod_IntegrationID', right_on='IntegrationID', how='left')
+        # ---------------------------------------------------------
+        # 5. ลบตาราง Staging เพื่อประหยัดพื้นที่ Postgres (Housekeeping)
+        # ---------------------------------------------------------
+        for stg_table in loaded_stg_tables:
+            conn.execute(text(f"DROP TABLE IF EXISTS {stg_table};"))
+        print("🧹 Cleaned up staging tables.")
 
-    # เลือกเฉพาะคอลัมน์ที่ใช้งานจริงลง Fact Table
-    fact_sales = fact_all[['DateKey', 'ProductKey', 'CustomerKey', 'Quantity', 'UnitPrice', 'SalesAmount', 'SourceSystem']]
-    fact_sales.insert(0, 'SalesKey', range(1, 1 + len(fact_sales))) # สร้าง Running Number ให้บรรทัดยอดขาย
-    
-    fact_sales.to_sql('fact_sales', target_engine, if_exists='replace', index=False)
-    print("✅ fact_sales created")
-
-@flow(name="End-to-End OmniCorp Pipeline")
+# ==========================================
+#  Orchestration Flow
+# ==========================================
+@flow(name="End-to-End OmniCorp Pipeline (Data Lakehouse)")
 def main_flow():
-    # 1. โหลดฐานข้อมูล SQLite
-    download_db()
+    # 1. โหลดข้อมูลลงโฟลเดอร์เครื่องเป็น Parquet (ครบทั้ง 24 ตาราง)
+    parquet_files = extract_to_bronze_parquet()
     
-    # 2. โหลดข้อมูลแบบ Raw ลง Data Lake Layer (เก็บไว้เผื่ออ้างอิง)
-    cnk_tables = ["Album", "Artist", "Customer", "Employee", "Genre", "Invoice", "InvoiceLine", "MediaType", "Playlist", "PlaylistTrack", "Track"]
-    nw_tables = ["Categories", "Customers", "Employees", "Order Details", "Orders", "Products"]
-    
-    load_raw_tables("chinook.db", cnk_tables, "cnk")
-    load_raw_tables("northwind.db", nw_tables, "nw")
-    
-    # 3. สร้าง Data Warehouse (Star Schema) แบบรวมศูนย์ OmniCorp
-    transform_omnicorp_star_schema()
+    # 2. ทำ ELT แปลงเป็น Star Schema ใน Postgres (ใช้แค่ 10 ตารางที่จำเป็น)
+    if parquet_files:
+        load_staging_and_transform_elt(parquet_files)
 
 if __name__ == "__main__":
     main_flow()
