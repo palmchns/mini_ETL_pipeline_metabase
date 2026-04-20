@@ -15,15 +15,22 @@ services:
       - dw_data:/var/lib/postgresql/data
     networks:
       - data_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engineer -d data_warehouse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # 2. เครื่องมือสร้าง Dashboard (Metabase)
   metabase:
     image: metabase/metabase:latest
     container_name: metabase_chinook_northwind
+    user: "root"
     ports:
       - "3001:3000"
     depends_on:
-      - postgres_dw
+      postgres_dw:
+        condition: service_healthy
     environment:                           
       - MB_DB_FILE=/metabase-data/metabase.db 
     volumes:                               
@@ -63,15 +70,16 @@ services:
     build: .
     container_name: etl_runner
     depends_on:
-      - prefect_server
-      - postgres_dw
+      postgres_dw:
+        condition: service_healthy
+      prefect_server:
+        condition: service_started
     environment:
       - PREFECT_API_URL=http://prefect_server:4200/api
       - IN_DOCKER=true
       - POSTGRES_USER=engineer
       - POSTGRES_PASSWORD=password123
       - POSTGRES_DB=data_warehouse
-    command: bash -c "sleep 15 && python ETL_pipeline.py" 
     networks:
       - data_network
 
