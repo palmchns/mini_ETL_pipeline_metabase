@@ -6,165 +6,221 @@ import tempfile
 from prefect import task, flow
 
 # ==========================================
-# ⚙️ Configuration & Database Setup
+# ⚙️ Configuration
 # ==========================================
-DB_HOST = "postgres_dw" if os.getenv("IN_DOCKER") else "localhost"
+DB_HOST = "omni_postgres" if os.getenv("IN_DOCKER") else "localhost"
 DB_USER = os.getenv("POSTGRES_USER", "engineer")
 DB_PASS = os.getenv("POSTGRES_PASSWORD", "password123")
 DB_DB = os.getenv("POSTGRES_DB", "data_warehouse")
-DB_PORT = "5432" if os.getenv("IN_DOCKER") else "5435"
+DB_PORT = "5432" if os.getenv("IN_DOCKER") else "5440"
 
 PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_DB}"
 
 # ==========================================
-# 🥉 Task 1: Extract & Load to Bronze (Postgres Raw)
+# 🥉 Task 1: Extract & Load to Bronze (Dynamic Full Load)
 # ==========================================
 @task(log_prints=True, retries=2)
 def load_raw_to_postgres():
-    """
-    ดาวน์โหลด SQLite ลง Temp File ใน Docker -> อ่านด้วย Pandas -> โหลดเข้าตาราง _raw_ ใน Postgres
-    """
     sources = {
-        "chinook": ("https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite", 
-                    ["Customer", "Track", "Genre", "Invoice", "InvoiceLine"]),
-        "nw": ("https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db", 
-               ["Customers", "Products", "Categories", "Orders", "Order Details"])
+        "chinook": "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite",
+        "nw": "https://github.com/jpwhite3/northwind-SQLite3/raw/main/dist/northwind.db"
     }
     
     target_engine = create_engine(PG_URI)
 
-    for prefix, (url, tables) in sources.items():
+    for prefix, url in sources.items():
         print(f"📥 Downloading {prefix} database...")
         r = requests.get(url)
         
-        # ใช้ Temp file ซึ่งจะหายไปเองเมื่อออกจาก block ไม่รกพื้นที่ใน Docker
         with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
             tmp.write(r.content)
             tmp.flush()
-            
             src_engine = create_engine(f"sqlite:///{tmp.name}")
             
+            # Fetch all tables dynamically
+            tables_df = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", src_engine)
+            tables = tables_df['name'].tolist()
+            
             for table in tables:
+                if table.startswith('sqlite_'):
+                    continue  # Skip internal SQLite tables
+                    
                 print(f"⏳ Extracting raw {table}...")
                 df = pd.read_sql(f'SELECT * FROM "{table}"', src_engine)
-                
-                # ทำความสะอาดชื่อคอลัมน์ให้อ่านง่าย
                 df.columns = [c.lower().replace(' ', '_') for c in df.columns]
                 
-                # แปลงวันที่
                 for col in df.columns:
                     if 'date' in col.lower() or 'time' in col.lower():
                         df[col] = pd.to_datetime(df[col], errors='coerce')
                 
-                # โหลดเข้าตาราง raw ใน Postgres (รันครั้งเดียว ใช้ replace ได้เลย)
                 target_name = f"{prefix}_raw_{table.lower().replace(' ', '_')}"
                 df.to_sql(target_name, target_engine, if_exists="replace", index=False)
                 print(f"✅ {target_name} loaded: {len(df)} rows")
 
 # ==========================================
-# 🥇 Task 2: In-Database Transform (Star Schema)
+# 🥇 Task 2: In-Database Transform (Full Schema)
 # ==========================================
 @task(log_prints=True)
 def transform_star_schema_in_db():
-    """
-    ใช้ SQL ประมวลผลจากตาราง Raw เพื่อสร้าง Star Schema ใน Postgres โดยตรง
-    รวดเร็ว และไม่กิน RAM ของ Docker Container
-    """
-    print("⏳ Executing In-Database Transformation for Star Schema...")
+    print("⏳ Executing In-Database Transformation for Full Star Schema...")
     target_engine = create_engine(PG_URI)
     
     with target_engine.begin() as conn:
         
-        # 1. สร้างและโหลด DimCustomer (ใช้ DROP & CREATE สำหรับ One-time run)
-        conn.execute(text("DROP TABLE IF EXISTS dim_customer CASCADE;"))
+        # 1. DimDate
+        conn.execute(text("DROP TABLE IF EXISTS dimdate CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE dim_customer (
-                customer_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                integration_id VARCHAR(100),
-                customer_name VARCHAR(255),
+            CREATE TABLE dimdate AS
+            SELECT
+                TO_CHAR(datum, 'YYYYMMDD')::INT AS datekey,
+                datum::DATE AS date,
+                EXTRACT(YEAR FROM datum)::INT AS year,
+                EXTRACT(QUARTER FROM datum)::INT AS quarter,
+                EXTRACT(MONTH FROM datum)::INT AS month,
+                EXTRACT(WEEK FROM datum)::INT AS week,
+                EXTRACT(DAY FROM datum)::INT AS day,
+                EXTRACT(ISODOW FROM datum)::INT AS dayofweek
+            FROM (SELECT generate_series('2000-01-01'::DATE, '2030-12-31'::DATE, '1 day') AS datum) d;
+            ALTER TABLE dimdate ADD PRIMARY KEY (datekey);
+        """))
+        print("✅ dimdate created")
+
+        # 2. DimSource_System
+        conn.execute(text("DROP TABLE IF EXISTS dimsource_system CASCADE;"))
+        conn.execute(text("""
+            CREATE TABLE dimsource_system (
+                sourcesystemkey VARCHAR PRIMARY KEY,
+                source_system_name VARCHAR,
+                description VARCHAR
+            );
+            INSERT INTO dimsource_system VALUES ('CHN', 'Chinook', 'Digital Music Store'), ('NWD', 'Northwind', 'Physical Goods Store');
+        """))
+        print("✅ dimsource_system created")
+
+        # 3. DimCustomer
+        conn.execute(text("DROP TABLE IF EXISTS dimcustomer CASCADE;"))
+        conn.execute(text("""
+            CREATE TABLE dimcustomer (
+                customerkey INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                customer_id VARCHAR(100),
                 company VARCHAR(255),
+                address VARCHAR(255),
                 city VARCHAR(100),
+                state VARCHAR(100),
+                postalcode VARCHAR(50),
+                country VARCHAR(100),
+                phone VARCHAR(100),
+                email VARCHAR(255),
+                fax VARCHAR(100)
+            );
+        """))
+        conn.execute(text("""
+            INSERT INTO dimcustomer (customer_id, company, address, city, state, postalcode, country, phone, email, fax)
+            SELECT 'CHN_' || customerid, company, address, city, state, postalcode, country, phone, email, fax FROM chinook_raw_customer
+            UNION ALL
+            SELECT 'NWD_' || customerid, companyname, address, city, region, postalcode, country, phone, NULL, fax FROM nw_raw_customers;
+        """))
+        print("✅ dimcustomer created")
+
+        # 4. DimEmployee
+        conn.execute(text("DROP TABLE IF EXISTS dimemployee CASCADE;"))
+        conn.execute(text("""
+            CREATE TABLE dimemployee (
+                employeekey INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                employee_id VARCHAR(100),
+                firstname VARCHAR(255),
+                lastname VARCHAR(255),
+                title VARCHAR(255),
+                hiredate TIMESTAMP,
                 country VARCHAR(100)
             );
         """))
         conn.execute(text("""
-            INSERT INTO dim_customer (integration_id, customer_name, company, city, country)
-            SELECT 'CHN_' || customerid, firstname || ' ' || lastname, company, city, country FROM chinook_raw_customer
+            INSERT INTO dimemployee (employee_id, firstname, lastname, title, hiredate, country)
+            SELECT 'CHN_' || employeeid, firstname, lastname, title, hiredate, country FROM chinook_raw_employee
             UNION ALL
-            SELECT 'NWD_' || customerid, contactname, companyname, city, country FROM nw_raw_customers;
+            SELECT 'NWD_' || employeeid, firstname, lastname, title, hiredate, country FROM nw_raw_employees;
         """))
-        print("✅ dim_customer created")
+        print("✅ dimemployee created")
 
-        # 2. สร้างและโหลด DimProduct
-        conn.execute(text("DROP TABLE IF EXISTS dim_product CASCADE;"))
+        # 5. DimProduct
+        conn.execute(text("DROP TABLE IF EXISTS dimproduct CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE dim_product (
-                product_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                integration_id VARCHAR(100),
-                product_name VARCHAR(255),
-                category_name VARCHAR(255)
+            CREATE TABLE dimproduct (
+                productkey INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                product_id VARCHAR(100),
+                productname VARCHAR(255),
+                genrekey INT,
+                genrename VARCHAR(255),
+                categorykey INT,
+                categoryname VARCHAR(255),
+                composer VARCHAR(255)
             );
         """))
         conn.execute(text("""
-            INSERT INTO dim_product (integration_id, product_name, category_name)
-            SELECT 'CHN_' || t.trackid, t.name, g.name 
+            INSERT INTO dimproduct (product_id, productname, genrekey, genrename, categorykey, categoryname, composer)
+            SELECT 'CHN_' || t.trackid, t.name, t.genreid, g.name, NULL, NULL, t.composer 
             FROM chinook_raw_track t LEFT JOIN chinook_raw_genre g ON t.genreid = g.genreid
             UNION ALL
-            SELECT 'NWD_' || p.productid, p.productname, c.categoryname 
+            SELECT 'NWD_' || p.productid, p.productname, NULL, NULL, p.categoryid, c.categoryname, NULL 
             FROM nw_raw_products p LEFT JOIN nw_raw_categories c ON p.categoryid = c.categoryid;
         """))
-        print("✅ dim_product created")
+        print("✅ dimproduct created")
 
-        # 3. สร้างและโหลด FactSales
-        conn.execute(text("DROP TABLE IF EXISTS fact_sales CASCADE;"))
+        # 6. FactSales
+        conn.execute(text("DROP TABLE IF EXISTS factsales CASCADE;"))
         conn.execute(text("""
-            CREATE TABLE fact_sales (
-                sales_key INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                date_key INT,
-                product_key INT,
-                customer_key INT,
-                quantity NUMERIC,
-                unit_price NUMERIC,
-                sales_amount NUMERIC,
-                source_system VARCHAR(50)
+            CREATE TABLE factsales (
+                factsalekey INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                datekey INT,
+                customerkey INT,
+                employeekey INT,
+                productkey INT,
+                sourcesystemkey VARCHAR(50),
+                salesquantity INT,
+                unitprice NUMERIC,
+                totalamount NUMERIC
             );
         """))
-        # ยอดขาย Chinook
         conn.execute(text("""
-            INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
+            INSERT INTO factsales (datekey, customerkey, employeekey, productkey, sourcesystemkey, salesquantity, unitprice, totalamount)
             SELECT 
                 CAST(TO_CHAR(CAST(i.invoicedate AS TIMESTAMP), 'YYYYMMDD') AS INT),
-                dp.product_key, dc.customer_key, il.quantity, il.unitprice,
-                (il.quantity * il.unitprice), 'Chinook'
-            FROM chinook_raw_invoiceline il
-            JOIN chinook_raw_invoice i ON il.invoiceid = i.invoiceid
-            LEFT JOIN dim_product dp ON dp.integration_id = 'CHN_' || il.trackid
-            LEFT JOIN dim_customer dc ON dc.integration_id = 'CHN_' || i.customerid;
+                dc.customerkey, de.employeekey, dp.productkey, 'CHN',
+                il.quantity, il.unitprice, (il.quantity * il.unitprice)
+            FROM chinook_raw_invoiceline il 
+            JOIN chinook_raw_invoice i ON il.invoiceid = i.invoiceid 
+            LEFT JOIN dimproduct dp ON dp.product_id = 'CHN_' || il.trackid 
+            LEFT JOIN dimcustomer dc ON dc.customer_id = 'CHN_' || i.customerid
+            LEFT JOIN chinook_raw_customer crc ON i.customerid = crc.customerid
+            LEFT JOIN dimemployee de ON de.employee_id = 'CHN_' || crc.supportrepid;
         """))
-        # ยอดขาย Northwind
         conn.execute(text("""
-            INSERT INTO fact_sales (date_key, product_key, customer_key, quantity, unit_price, sales_amount, source_system)
+            INSERT INTO factsales (datekey, customerkey, employeekey, productkey, sourcesystemkey, salesquantity, unitprice, totalamount)
             SELECT 
                 CAST(TO_CHAR(CAST(o.orderdate AS TIMESTAMP), 'YYYYMMDD') AS INT),
-                dp.product_key, dc.customer_key, od.quantity, od.unitprice,
-                (od.quantity * od.unitprice), 'Northwind'
-            FROM nw_raw_order_details od
-            JOIN nw_raw_orders o ON od.orderid = o.orderid
-            LEFT JOIN dim_product dp ON dp.integration_id = 'NWD_' || od.productid
-            LEFT JOIN dim_customer dc ON dc.integration_id = 'NWD_' || o.customerid;
+                dc.customerkey, de.employeekey, dp.productkey, 'NWD',
+                od.quantity, od.unitprice, (od.quantity * od.unitprice)
+            FROM nw_raw_order_details od 
+            JOIN nw_raw_orders o ON od.orderid = o.orderid 
+            LEFT JOIN dimproduct dp ON dp.product_id = 'NWD_' || od.productid 
+            LEFT JOIN dimcustomer dc ON dc.customer_id = 'NWD_' || o.customerid
+            LEFT JOIN dimemployee de ON de.employee_id = 'NWD_' || o.employeeid;
         """))
-        print("✅ fact_sales created")
+        print("✅ factsales created")
 
 # ==========================================
 #  Orchestration Flow
 # ==========================================
-@flow(name="One-Time OmniCorp Initial Load (Docker Optimized)")
+@flow(name="OmniCorp ELT Pipeline (Full ERD)")
 def main_flow():
-    # 1. ดูดข้อมูลลงตาราง _raw_ ใน Postgres (ผ่าน Temp file เพื่อไม่ให้ Docker รก)
     load_raw_to_postgres()
-    
-    # 2. ให้ Postgres จัดการ Join และสร้าง Star Schema ให้เอง (ประหยัด RAM)
     transform_star_schema_in_db()
 
 if __name__ == "__main__":
+    print("🚀 Starting Initial Automatic Run...")
     main_flow()
+    
+    print("📡 Deploying to Prefect Server and waiting for Quick Runs...")
+    # การใช้ .serve() จะช่วยให้โชว์ในแท็บ Deployment และเปิดสแตนด์บายไว้
+    main_flow.serve(name="OmniCorp-Manual-Trigger", tags=["ELT", "DataWarehouse"])

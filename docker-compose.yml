@@ -1,59 +1,55 @@
 version: '3.8'
 
 services:
-  # 1. โกดังข้อมูล (Data Warehouse)
-  postgres_dw:
+  omni_postgres:
     image: postgres:15-alpine
-    container_name: postgres_dw
+    container_name: omni_postgres
     ports:
-      - "5435:5432"
+      - "5440:5432"
     environment:
       - POSTGRES_USER=engineer
       - POSTGRES_PASSWORD=password123
       - POSTGRES_DB=data_warehouse
     volumes:
-      - dw_data:/var/lib/postgresql/data
+      - omni_dw_data:/var/lib/postgresql/data
     networks:
-      - data_network
+      - omni_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U engineer -d data_warehouse"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # 2. เครื่องมือสร้าง Dashboard (Metabase)
-  metabase:
+  omni_metabase:
     image: metabase/metabase:latest
-    container_name: metabase_chinook_northwind
+    container_name: omni_metabase
     user: "root"
     ports:
-      - "3001:3000"
+      - "3050:3000"
     depends_on:
-      postgres_dw:
+      omni_postgres:
         condition: service_healthy
     environment:                           
       - MB_DB_FILE=/metabase-data/metabase.db 
     volumes:                               
-      - metabase_data:/metabase-data
+      - omni_metabase_data:/metabase-data
     networks:
-      - data_network
+      - omni_network
 
-  # 3. ตัวจัดการ Pipeline (Prefect Server)
-  prefect_server:
+  omni_prefect:
     image: prefecthq/prefect:3-latest
-    container_name: prefect_server
+    container_name: omni_prefect
     command: prefect server start --host 0.0.0.0
     environment:
-      - PREFECT_UI_API_URL=http://localhost:4201/api
+      - PREFECT_UI_API_URL=http://localhost:4205/api
     ports:
-      - "4201:4200"
+      - "4205:4200"
     networks:
-      - data_network
+      - omni_network
 
-  # 4. ตัวทดลองเขียนโค้ด (Jupyter Notebook)
-  jupyter:
+  omni_jupyter:
     image: jupyter/scipy-notebook:latest
-    container_name: jupyter_dev
+    container_name: omni_jupyter
     user: root
     environment:
       - JUPYTER_TOKEN=prefect
@@ -61,32 +57,31 @@ services:
     volumes:
       - .:/home/jovyan/work
     ports:
-      - "8088:8888"
+      - "8890:8888"
     networks:
-      - data_network
+      - omni_network
 
-  # 5. ตัวรัน Pipeline (Build จาก Dockerfile)
-  etl_runner:
+  omni_elt_runner:
     build: .
-    container_name: etl_runner
+    container_name: omni_elt_runner
     depends_on:
-      postgres_dw:
+      omni_postgres:
         condition: service_healthy
-      prefect_server:
+      omni_prefect:
         condition: service_started
     environment:
-      - PREFECT_API_URL=http://prefect_server:4200/api
+      - PREFECT_API_URL=http://omni_prefect:4200/api
       - IN_DOCKER=true
       - POSTGRES_USER=engineer
       - POSTGRES_PASSWORD=password123
       - POSTGRES_DB=data_warehouse
     networks:
-      - data_network
+      - omni_network
 
 volumes:
-  dw_data:
-  metabase_data: 
+  omni_dw_data:
+  omni_metabase_data: 
 
 networks:
-  data_network:
+  omni_network:
     driver: bridge
