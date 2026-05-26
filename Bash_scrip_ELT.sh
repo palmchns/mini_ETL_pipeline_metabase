@@ -3,7 +3,7 @@ set -e
 
 # ==============================================================================
 # PROJECT: OmniCorp ELT Data Stack (Full Kimball Star Schema Edition)
-# DESCRIPTION: One-Click Setup with complete ER Diagram mapping & Prefect Deployment
+# DESCRIPTION: Production-Ready Setup (Cross-Platform / Windows & Mac Compatible)
 # ==============================================================================
 
 PROJECT_DIR="omnicorp_data_stack"
@@ -25,7 +25,7 @@ fi
 # ==========================================
 echo "📦 Generating requirements.txt..."
 cat << 'EOF' > requirements.txt
-prefect
+prefect>=3.0.0
 pandas
 sqlalchemy
 psycopg2-binary
@@ -42,6 +42,7 @@ from sqlalchemy import create_engine, text
 import os
 import requests
 import tempfile
+import time
 from prefect import task, flow
 
 # ==========================================
@@ -55,8 +56,21 @@ DB_PORT = "5432" if os.getenv("IN_DOCKER") else "5440"
 
 PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_DB}"
 
+def wait_for_db(engine, retries=10, delay=5):
+    """ฟังก์ชันชะลอการทำงานจนกว่า Database จะพร้อม (Best Practice)"""
+    for i in range(retries):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+                print("✅ Database is ready!")
+                return
+        except Exception:
+            print(f"⏳ Waiting for database... (Attempt {i+1}/{retries})")
+            time.sleep(delay)
+    raise ConnectionError("❌ Database connection failed after multiple retries.")
+
 # ==========================================
-# 🥉 Task 1: Extract & Load to Bronze (Dynamic Full Load)
+# 🥉 Task 1: Extract & Load to Bronze
 # ==========================================
 @task(log_prints=True, retries=2)
 def load_raw_to_postgres():
@@ -66,23 +80,25 @@ def load_raw_to_postgres():
     }
     
     target_engine = create_engine(PG_URI)
+    wait_for_db(target_engine) # เช็กว่า DB พร้อมก่อนทำงาน
 
     for prefix, url in sources.items():
         print(f"📥 Downloading {prefix} database...")
         r = requests.get(url)
         
-        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
             tmp.write(r.content)
             tmp.flush()
-            src_engine = create_engine(f"sqlite:///{tmp.name}")
+            tmp_path = tmp.name
             
-            # Fetch all tables dynamically
+        try:
+            src_engine = create_engine(f"sqlite:///{tmp_path}")
             tables_df = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", src_engine)
             tables = tables_df['name'].tolist()
             
             for table in tables:
                 if table.startswith('sqlite_'):
-                    continue  # Skip internal SQLite tables
+                    continue  
                     
                 print(f"⏳ Extracting raw {table}...")
                 df = pd.read_sql(f'SELECT * FROM "{table}"', src_engine)
@@ -95,9 +111,13 @@ def load_raw_to_postgres():
                 target_name = f"{prefix}_raw_{table.lower().replace(' ', '_')}"
                 df.to_sql(target_name, target_engine, if_exists="replace", index=False)
                 print(f"✅ {target_name} loaded: {len(df)} rows")
+        finally:
+            # Clean up temp file (สำคัญสำหรับ Windows)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 # ==========================================
-# 🥇 Task 2: In-Database Transform (Full Schema)
+# 🥇 Task 2: In-Database Transform
 # ==========================================
 @task(log_prints=True)
 def transform_star_schema_in_db():
@@ -105,7 +125,6 @@ def transform_star_schema_in_db():
     target_engine = create_engine(PG_URI)
     
     with target_engine.begin() as conn:
-        
         # 1. DimDate
         conn.execute(text("DROP TABLE IF EXISTS dimdate CASCADE;"))
         conn.execute(text("""
@@ -122,8 +141,7 @@ def transform_star_schema_in_db():
             FROM (SELECT generate_series('2000-01-01'::DATE, '2030-12-31'::DATE, '1 day') AS datum) d;
             ALTER TABLE dimdate ADD PRIMARY KEY (datekey);
         """))
-        print("✅ dimdate created")
-
+        
         # 2. DimSource_System
         conn.execute(text("DROP TABLE IF EXISTS dimsource_system CASCADE;"))
         conn.execute(text("""
@@ -134,7 +152,6 @@ def transform_star_schema_in_db():
             );
             INSERT INTO dimsource_system VALUES ('CHN', 'Chinook', 'Digital Music Store'), ('NWD', 'Northwind', 'Physical Goods Store');
         """))
-        print("✅ dimsource_system created")
 
         # 3. DimCustomer
         conn.execute(text("DROP TABLE IF EXISTS dimcustomer CASCADE;"))
@@ -159,7 +176,6 @@ def transform_star_schema_in_db():
             UNION ALL
             SELECT 'NWD_' || customerid, companyname, address, city, region, postalcode, country, phone, NULL, fax FROM nw_raw_customers;
         """))
-        print("✅ dimcustomer created")
 
         # 4. DimEmployee
         conn.execute(text("DROP TABLE IF EXISTS dimemployee CASCADE;"))
@@ -180,7 +196,6 @@ def transform_star_schema_in_db():
             UNION ALL
             SELECT 'NWD_' || employeeid, firstname, lastname, title, hiredate, country FROM nw_raw_employees;
         """))
-        print("✅ dimemployee created")
 
         # 5. DimProduct
         conn.execute(text("DROP TABLE IF EXISTS dimproduct CASCADE;"))
@@ -204,7 +219,6 @@ def transform_star_schema_in_db():
             SELECT 'NWD_' || p.productid, p.productname, NULL, NULL, p.categoryid, c.categoryname, NULL 
             FROM nw_raw_products p LEFT JOIN nw_raw_categories c ON p.categoryid = c.categoryid;
         """))
-        print("✅ dimproduct created")
 
         # 6. FactSales
         conn.execute(text("DROP TABLE IF EXISTS factsales CASCADE;"))
@@ -246,7 +260,7 @@ def transform_star_schema_in_db():
             LEFT JOIN dimcustomer dc ON dc.customer_id = 'NWD_' || o.customerid
             LEFT JOIN dimemployee de ON de.employee_id = 'NWD_' || o.employeeid;
         """))
-        print("✅ factsales created")
+    print("✅ All transformations completed!")
 
 # ==========================================
 #  Orchestration Flow
@@ -258,10 +272,17 @@ def main_flow():
 
 if __name__ == "__main__":
     print("🚀 Starting Initial Automatic Run...")
-    main_flow()
+    # หน่วงเวลาเล็กน้อยให้มั่นใจว่า Prefect API บูตเสร็จสมบูรณ์
+    time.sleep(10) 
+    
+    try:
+        main_flow()
+    except Exception as e:
+        print(f"⚠️ Initial run failed (maybe Prefect isn't fully up yet): {e}")
+        print("Re-throwing to trigger container restart...")
+        raise
     
     print("📡 Deploying to Prefect Server and waiting for Quick Runs...")
-    # การใช้ .serve() จะช่วยให้โชว์ในแท็บ Deployment และเปิดสแตนด์บายไว้
     main_flow.serve(name="OmniCorp-Manual-Trigger", tags=["ELT", "DataWarehouse"])
 EOF
 
@@ -275,6 +296,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
+# 📌 The Ultimate Windows Fix: ลบ Carriage Returns (\r) ออกจากไฟล์ Python
+RUN sed -i 's/\r$//' elt_pipeline.py
 CMD ["python", "elt_pipeline.py"]
 EOF
 
@@ -331,6 +354,12 @@ services:
       - "4205:4200"
     networks:
       - omni_network
+    healthcheck:
+      # เช็กว่า API ของ Prefect ตอบสนองแล้วหรือยัง
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4200/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   omni_jupyter:
     image: jupyter/scipy-notebook:latest
@@ -349,11 +378,11 @@ services:
   omni_elt_runner:
     build: .
     container_name: omni_elt_runner
+    # 📌 ถ้าพังจาก Network ให้พยายามรันใหม่เรื่อยๆ จนกว่าจะสำเร็จ
+    restart: on-failure
     depends_on:
       omni_postgres:
         condition: service_healthy
-      omni_prefect:
-        condition: service_started
     environment:
       - PREFECT_API_URL=http://omni_prefect:4200/api
       - IN_DOCKER=true
@@ -382,12 +411,12 @@ echo "-------------------------------------------------------"
 
 docker compose up -d
 
-echo echo ""
+echo ""
 echo "🎉 DEPLOYMENT COMPLETE!"
 echo "-------------------------------------------------------"
 echo "💡 The ELT pipeline is currently running its initial load."
-echo "After finishing, it will stay online for Manual Quick Runs."
-echo "📊 Metabase UI:       http://localhost:3050"
-echo "🌊 Prefect UI:        http://localhost:4205"
+echo "If it fails on startup (e.g. waiting for Prefect), it will AUTO-RESTART until successful."
+echo "📊 Metabase UI:        http://localhost:3050"
+echo "🌊 Prefect UI:         http://localhost:4205"
 echo "📓 Jupyter Notebook:  http://localhost:8890 (Token: prefect)"
 echo "-------------------------------------------------------"
