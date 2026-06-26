@@ -69,6 +69,27 @@ def wait_for_db(engine, retries=10, delay=5):
             time.sleep(delay)
     raise ConnectionError("❌ Database connection failed after multiple retries.")
 
+def wait_for_prefect(retries=12, delay=5):
+    """ฟังก์ชันชะลอการทำงานจนกว่า Prefect API จะพร้อม"""
+    # ดึง URL จาก environment variable และสร้าง health check endpoint
+    prefect_api_url = os.getenv("PREFECT_API_URL")
+    if not prefect_api_url:
+        print("⚠️ PREFECT_API_URL not set. Skipping Prefect health check.")
+        return
+    health_check_url = prefect_api_url.replace("/api", "/api/health")
+
+    for i in range(retries):
+        try:
+            response = requests.get(health_check_url)
+            if response.status_code == 200:
+                print("✅ Prefect API is ready!")
+                return
+        except requests.ConnectionError:
+            pass # เพิกเฉยต่อ Connection Error แล้วลองใหม่
+        print(f"⏳ Waiting for Prefect API... (Attempt {i+1}/{retries})")
+        time.sleep(delay)
+    raise ConnectionError("❌ Prefect API connection failed after multiple retries.")
+
 # ==========================================
 # 🥉 Task 1: Extract & Load to Bronze
 # ==========================================
@@ -272,15 +293,9 @@ def main_flow():
 
 if __name__ == "__main__":
     print("🚀 Starting Initial Automatic Run...")
-    # หน่วงเวลาเล็กน้อยให้มั่นใจว่า Prefect API บูตเสร็จสมบูรณ์
-    time.sleep(10) 
-    
-    try:
-        main_flow()
-    except Exception as e:
-        print(f"⚠️ Initial run failed (maybe Prefect isn't fully up yet): {e}")
-        print("Re-throwing to trigger container restart...")
-        raise
+    # รอให้ Service ที่จำเป็น (DB และ Prefect) พร้อมทำงานก่อน
+    wait_for_prefect()
+    main_flow()
     
     print("📡 Deploying to Prefect Server and waiting for Quick Runs...")
     main_flow.serve(name="OmniCorp-Manual-Trigger", tags=["ELT", "DataWarehouse"])
@@ -382,6 +397,8 @@ services:
     restart: on-failure
     depends_on:
       omni_postgres:
+        condition: service_healthy
+      omni_prefect:
         condition: service_healthy
     environment:
       - PREFECT_API_URL=http://omni_prefect:4200/api

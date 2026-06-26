@@ -44,6 +44,11 @@ services:
       - PREFECT_UI_API_URL=http://localhost:4205/api
     ports:
       - "4205:4200"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4200/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     networks:
       - omni_network
 
@@ -64,11 +69,12 @@ services:
   omni_elt_runner:
     build: .
     container_name: omni_elt_runner
+    restart: on-failure
     depends_on:
       omni_postgres:
         condition: service_healthy
       omni_prefect:
-        condition: service_started
+        condition: service_healthy
     environment:
       - PREFECT_API_URL=http://omni_prefect:4200/api
       - IN_DOCKER=true
